@@ -1,0 +1,213 @@
+---
+- name: Migrate Volume/Share to Alternate DataCenter
+  hosts: localhost
+  vars:
+        hostname: ydcntap1
+        source_hostname: odcntap1
+        y_hostname: ydcntap1
+        o_hostname: odcntap1
+        ydc_source_endpoint: ydcsvm800gp01:ISCV_netapp_prod
+        odc_dest_endpoint: odcsvm800gp01:ISCV_netapp_prod_dest
+        odc_source_endpoint: odcsvm800gp01:ISCV_netapp_prod_dest
+        ydc_dest_endpoint: ydcsvm800gp01:ISCV_netapp_prod
+        ydc_source_vol: ISCV_netapp_prod
+        ydc_source_vserver: ydcsvm800gp01
+        odc_dest_vol: ISCV_netapp_prod_dest
+        odc_dest_vserver: odcsvm800gp01
+        ydc_dest_vol: ISCV_netapp_prod
+        ydc_dest_vserver: ydcsvm800gp01
+        odc_source_vol: ISCV_netapp_prod_dest
+        odc_source_vserver: odcsvm800gp01
+        https: yes
+        validate_certs: false
+        ansible_python_interpreter: /usr/bin/python3
+        use_rest: always
+  gather_facts: no
+  collections:
+    - netapp.ontap
+  tasks:
+
+    - name: checking to see if the target Volume is in the correct state
+      na_ontap_rest_info:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        hostname: "{{ hostname }}"
+        https: yes
+        validate_certs: no
+        gather_subset:
+          - volume_info
+        use_python_keys: yes
+        fields:
+          - 'name'
+          - 'type'
+        parameters:
+          name: "{{ ydc_dest_vol }}"
+      register: volume_info
+    - assert:
+        that:
+              - volume_info.ontap_info.storage_volumes.records.0.type is defined
+              - volume_info.ontap_info.storage_volumes.records.0.type == "dp"
+        fail_msg: "Playbook exiting, Failed check for correct direction to move from {{ source_hostname }} to {{ hostname }} "
+        success_msg: "Ok to migration from {{ source_hostname }} to {{ hostname }} "
+    - name: Umount Source Volume
+      na_ontap_volume:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        https: yes
+        validate_certs: false
+        state: present
+        hostname: "{{ source_hostname }}"
+        vserver: "{{ odc_source_vserver }}"
+        name: "{{ odc_source_vol }}"
+        # following line will umount the volume
+        junction_path: "{{ '' }}"
+        # following line will mount the volume
+        #junction_path: "/{{ odc_source_vol }}"
+        #
+    - name: Check for Snapmirror transfer status
+      na_ontap_rest_info:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        hostname: "{{ hostname }}"
+        https: yes
+        validate_certs: no
+        gather_subset:
+          - snapmirror_info
+        use_python_keys: yes
+        fields:
+          - 'transfer'
+          - 'state'
+        parameters:
+          destination.path: "{{ ydc_dest_endpoint }}"
+      register: snapmirror_list
+      until: |-
+            snapmirror_list.ontap_info.snapmirror_relationships.records.0.transfer is not defined or
+            snapmirror_list.ontap_info.snapmirror_relationships.records.0.transfer.state != "transferring"
+      delay: 30
+      retries: 30
+
+    - name: Update Volume Snapmirror Relationship
+      na_ontap_snapmirror:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        https: yes
+        validate_certs: false
+        state: present
+        update: true
+        source_endpoint: 
+                path: "{{ odc_source_endpoint }}"
+        destination_endpoint: 
+                path: "{{ ydc_dest_endpoint }}"
+        source_hostname: "{{ source_hostname }}"
+        hostname: "{{ hostname }}"
+
+    - name: Waiting for SnapMirror to become idle
+      na_ontap_rest_info:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        hostname: "{{ hostname }}"
+        https: yes
+        validate_certs: no
+        gather_subset:
+          - snapmirror_info
+        use_python_keys: yes
+        fields:
+          - 'transfer'
+          - 'state'
+        parameters:
+          destination.path: "{{ ydc_dest_endpoint }}"
+      register: snapmirror_list
+      until: |-
+            snapmirror_list.ontap_info.snapmirror_relationships.records.0.transfer is not defined or
+            snapmirror_list.ontap_info.snapmirror_relationships.records.0.transfer.state != "transferring"
+      delay: 30
+      retries: 30
+
+    - name: Break Volume Snapmirror Relationship
+      na_ontap_snapmirror:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        https: yes
+        validate_certs: false
+        state: present
+        relationship_state: broken
+        source_endpoint: 
+                path: "{{ odc_source_endpoint }}"
+        destination_endpoint: 
+                path: "{{ ydc_dest_endpoint }}"
+        source_hostname: "{{ source_hostname }}"
+        hostname: "{{ hostname }}"
+
+    - name: Delete Sync Volume Snapmirror Relationship
+      na_ontap_snapmirror:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        https: yes
+        validate_certs: false
+        state: present
+        relationship_state: active
+        source_endpoint: 
+                path: "{{ ydc_source_endpoint }}"
+        destination_endpoint: 
+                path: "{{ odc_dest_endpoint }}"
+        hostname: "{{ o_hostname }}"
+
+    - name: Delete Volume Snapmirror Relationship
+      na_ontap_snapmirror:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        https: yes
+        validate_certs: false
+        state: absent
+        relationship_info_only: true
+        source_endpoint: 
+                path: "{{ odc_source_endpoint }}"
+        destination_endpoint: 
+                path: "{{ ydc_dest_endpoint }}"
+        hostname: "{{ y_hostname }}"
+
+    - name: Pausing Playbook for snapmirror to sync up
+      ansible.builtin.pause:
+        seconds: 30
+
+    - name: Start Sync Volume Snapmirror Relationship
+      na_ontap_snapmirror:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        https: yes
+        validate_certs: false
+        state: present
+        relationship_state: active
+        source_endpoint: 
+                path: "{{ ydc_source_endpoint }}"
+        destination_endpoint: 
+                path: "{{ odc_dest_endpoint }}"
+        hostname: "{{ o_hostname }}"
+
+    - name: Mount Destination Volume
+      na_ontap_volume:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        https: yes
+        validate_certs: false
+        state: present
+        hostname: "{{ y_hostname }}"
+        vserver: "{{ ydc_source_vserver }}"
+        name: "{{ ydc_dest_vol }}"
+        # following line will umount the volume
+        #junction_path: "{{ '' }}"
+        # following line will mount the volume
+        junction_path: "/{{ ydc_dest_vol }}"
+    - name: Pausing Playbook so DFS timeout can expire
+      ansible.builtin.pause:
+        seconds: 120

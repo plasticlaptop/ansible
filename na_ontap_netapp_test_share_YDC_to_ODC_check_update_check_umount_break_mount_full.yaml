@@ -1,0 +1,195 @@
+# Playbook to migrate a Netapp share from YDC to ODC
+# First block of playbook is to setup vars (variables)
+# This first section needs to be changed to match the share that needs to be migrated
+# One note is that the target volume needs to umounted in normal state
+---
+- name: Migrate Volume/Share to Alternate DataCenter
+  hosts: localhost
+  vars:
+        hostname: odcntap1
+        source_hostname: ydcntap1
+        y_hostname: ydcntap1
+        o_hostname: odcntap1
+        ydc_source_endpoint: ydcsvm500ts01:netapp_dfs_vol_test
+        odc_dest_endpoint: odcsvm500ts01:netapp_dfs_vol_test_dest
+        odc_source_endpoint: odcsvm500ts01:netapp_dfs_vol_test_dest
+        ydc_dest_endpoint: ydcsvm500ts01:netapp_dfs_vol_test
+        ydc_source_vol: netapp_dfs_vol_test
+        ydc_source_vserver: ydcsvm500ts01
+        odc_dest_vol: netapp_dfs_vol_test_dest
+        odc_dest_vserver: odcsvm500ts01
+        ydc_dest_vol: netapp_dfs_vol_test
+        ydc_dest_vserver: ydcsvm500ts01
+        odc_source_vol: netapp_dfs_vol_test_dest
+        odc_source_vserver: odcsvm500ts01
+        https: yes
+        validate_certs: false
+        ansible_python_interpreter: /usr/bin/python3
+        use_rest: always
+  gather_facts: no
+
+# **************NO NOT EDIT BELOW THIS LINE******************************
+#
+# add the line collections to make sure the netapp collection is imported
+#
+  collections:
+    - netapp.ontap
+
+# first task checks to make sure the volume is in the correct state so that the 
+# sync is not started in the incorrect direction
+#
+  tasks:
+    - name: checking to see if the target Volume is in the correct state
+      na_ontap_rest_info:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        hostname: "{{ hostname }}"
+        https: yes
+        validate_certs: no
+        gather_subset:
+          - volume_info
+        use_python_keys: yes
+        fields:
+          - 'name'
+          - 'type'
+        parameters:
+          name: "{{ odc_dest_vol }}"
+      register: volume_info
+# the assert: here checkes to make sure the volume exists and is the target of replication
+    - assert:
+        that:
+              - volume_info.ontap_info.storage_volumes.records.0.type is defined
+              - volume_info.ontap_info.storage_volumes.records.0.type == "dp"
+        fail_msg: "Playbook exiting, Failed check for correct direction to move from {{ source_hostname }} to {{ hostname }} "
+        success_msg: "Ok to migration from {{ source_hostname }} to {{ hostname }} "
+
+# next task updates the volume with the latest block changes
+#
+    - name: Update Volume Snapmirror Relationship
+      na_ontap_snapmirror:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        https: yes
+        validate_certs: false
+        state: present
+        update: true
+        source_endpoint: 
+                path: "{{ ydc_source_endpoint }}"
+        destination_endpoint: 
+                path: "{{ odc_dest_endpoint }}"
+        source_hostname: "{{ source_hostname }}"
+        hostname: "{{ hostname }}"
+
+# next task checks to make sure all of the block changes have replicated
+#
+    - name: Waiting for SnapMirror to become idle
+      na_ontap_rest_info:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        hostname: "{{ hostname }}"
+        https: yes
+        validate_certs: no
+        gather_subset:
+          - snapmirror_info
+        use_python_keys: yes
+        fields:
+          - 'transfer'
+          - 'state'
+        parameters:
+          destination.path: "{{ odc_dest_endpoint }}"
+      register: snapmirror_list
+      until: |-
+            snapmirror_list.ontap_info.snapmirror_relationships.records.0.transfer is not defined or
+            snapmirror_list.ontap_info.snapmirror_relationships.records.0.transfer.state != "transferring"
+      delay: 30
+      retries: 30
+
+# next task stops replication 
+
+    - name: Break Volume Snapmirror Relationship
+      na_ontap_snapmirror:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        https: yes
+        validate_certs: false
+        state: present
+        relationship_state: broken
+        source_endpoint: 
+                path: "{{ ydc_source_endpoint }}"
+        destination_endpoint: 
+                path: "{{ odc_dest_endpoint }}"
+        source_hostname: "{{ source_hostname }}"
+        hostname: "{{ hostname }}"
+
+# next task reverses miror relationship
+
+    - name: Remove Vol Snapmirror Relationship
+      na_ontap_snapmirror:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        https: yes
+        validate_certs: false
+        state: present
+        relationship_state: active
+        source_endpoint: 
+                path: "{{ odc_source_endpoint }}"
+        destination_endpoint: 
+                path: "{{ ydc_dest_endpoint }}"
+        hostname: "{{ y_hostname }}"
+
+# next task removes relationship info on source
+#
+    - name: Delete Volume Snapmirror Relationship
+      na_ontap_snapmirror:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        https: yes
+        validate_certs: false
+        state: absent
+        relationship_info_only: true
+        source_endpoint: 
+                path: "{{ ydc_source_endpoint }}"
+        destination_endpoint: 
+                path: "{{ odc_dest_endpoint}}"
+        hostname: "{{ o_hostname }}"
+
+# next task starts reverse sync
+
+    - name: Start Sync Volume Snapmirror Relationship
+      na_ontap_snapmirror:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        https: yes
+        validate_certs: false
+        state: present
+        relationship_state: active
+        source_endpoint: 
+                path: "{{ odc_source_endpoint }}"
+        destination_endpoint: 
+                path: "{{ ydc_dest_endpoint }}"
+        hostname: "{{ y_hostname }}"
+
+# next task mounts the target volume so it can be accessed
+#
+    - name: Mount Destination Volume
+      na_ontap_volume:
+        cert_filepath: /home/ansible2/ansible2.pem
+        key_filepath: /home/ansible2/ansible2.key
+        use_rest: always
+        https: yes
+        validate_certs: false
+        state: present
+        hostname: "{{ o_hostname }}"
+        vserver: "{{ odc_dest_vserver }}"
+        name: "{{ odc_dest_vol }}"
+        # following line will umount the volume
+        #junction_path: "{{ '' }}"
+        # following line will mount the volume
+        junction_path: "/{{ odc_dest_vol }}"
